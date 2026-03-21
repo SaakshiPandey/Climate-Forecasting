@@ -7,6 +7,7 @@ import numpy as np
 
 DATA_PATH = "data/processed/split_data"
 MODEL_PATH = "models"
+PREDICTIONS_PATH = "data/processed"
 
 def train_lightgbm():
 
@@ -78,6 +79,29 @@ def train_lightgbm():
 
     print("\nTest RMSE:", test_rmse)
     print("Test MAE:", test_mae)
+
+    # -----------------------
+    # Save predictions
+    # -----------------------
+
+    os.makedirs(PREDICTIONS_PATH, exist_ok=True)
+
+    val_results = pd.DataFrame({
+        "Date": val["Date"].values,
+        "City": val["City"].values,
+        "y_true": y_val,
+        "lgbm_pred": val_preds
+    })
+
+    test_results = pd.DataFrame({
+        "Date": test["Date"].values,
+        "City": test["City"].values,
+        "y_true": y_test,
+        "lgbm_pred": test_preds
+    })
+
+    val_results.to_csv(f"{PREDICTIONS_PATH}/lgbm_val_preds.csv", index=False)
+    test_results.to_csv(f"{PREDICTIONS_PATH}/lgbm_test_preds.csv", index=False)
 
     # -----------------------
     # Save model

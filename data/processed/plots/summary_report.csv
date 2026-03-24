@@ -1,0 +1,5 @@
+Metric,LightGBM,GRU,Hybrid (Ridge)
+RMSE (°C),0.7847,26.4453,0.7874
+MAE (°C),0.5686,26.1646,0.5725
+R² Score,0.9713,-31.5781,0.9711
+Best Temperature Range,Warm (25-35°C),Cold (<15°C),Warm (25-35°C)

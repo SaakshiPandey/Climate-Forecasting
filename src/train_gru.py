@@ -1,3 +1,8 @@
+"""
+COMPLETE FIXED GRU MODEL - Direct Temperature Prediction
+No target scaling - predicts actual temperatures directly
+"""
+
 import os
 import numpy as np
 import pandas as pd
@@ -12,12 +17,8 @@ warnings.filterwarnings('ignore')
 # ================= CONFIG =================
 DATA_PATH = "data/processed/climate_feature_engineered.csv"
 MODEL_PATH = "models"
-MODEL_FILE = os.path.join(MODEL_PATH, "gru_model.pth")
+MODEL_FILE = os.path.join(MODEL_PATH, "gru_model_final.pth")
 PREDICTIONS_PATH = "data/processed"
-
-# Create directories if they don't exist
-os.makedirs(MODEL_PATH, exist_ok=True)
-os.makedirs(PREDICTIONS_PATH, exist_ok=True)
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {DEVICE}")
@@ -25,18 +26,20 @@ print(f"Using device: {DEVICE}")
 SEED = 42
 WINDOW = 30
 BATCH_SIZE = 256
-EPOCHS = 50
-PATIENCE = 10
-LR = 1e-3
+EPOCHS = 25
+PATIENCE = 15
+LR = 0.001
 WEIGHT_DECAY = 1e-5
 
 torch.manual_seed(SEED)
 np.random.seed(SEED)
 
-# ================= OPTIMIZED FEATURES =================
+# ================= FEATURES =================
 SELECTED_FEATURES = [
     "T2M", "RH2M", "PRECTOTCORR", "WS2M", "PS",
     "T2M_lag1", "T2M_lag3", "T2M_lag7",
+    "RH2M_lag1", "RH2M_lag3", "RH2M_lag7",
+    "PRECTOTCORR_lag1", "PRECTOTCORR_lag3", "PRECTOTCORR_lag7",
     "T2M_roll7_mean", "T2M_roll30_mean",
     "City_Code"
 ]
@@ -74,9 +77,9 @@ def create_sequences(df, features, target, window):
     
     return np.array(X, dtype=np.float32), np.array(y, dtype=np.float32), pd.DataFrame(meta)
 
-# ================= LIGHTWEIGHT MODEL =================
-class LightGRU(nn.Module):
-    def __init__(self, input_size, hidden_size=64, num_layers=2, dropout=0.2):
+# ================= GRU MODEL =================
+class DirectGRU(nn.Module):
+    def __init__(self, input_size, hidden_size=128, num_layers=2, dropout=0.2):
         super().__init__()
         
         self.gru = nn.GRU(
@@ -88,9 +91,11 @@ class LightGRU(nn.Module):
         )
         
         self.head = nn.Sequential(
-            nn.Linear(hidden_size, 32),
+            nn.Linear(hidden_size, 64),
             nn.ReLU(),
             nn.Dropout(0.2),
+            nn.Linear(64, 32),
+            nn.ReLU(),
             nn.Linear(32, 1)
         )
         
@@ -100,56 +105,74 @@ class LightGRU(nn.Module):
         out = self.head(last_out)
         return out.squeeze(-1)
 
-# ================= OPTIMIZED TRAINING LOOP =================
-def run_epoch(loader, model, optimizer, criterion, train=True):
-    if train:
-        model.train()
-    else:
-        model.eval()
-    
+# ================= TRAINING =================
+def train_epoch(loader, model, optimizer, criterion):
+    model.train()
     total_loss = 0
-    preds, targets = [], []
     
     for X, y in loader:
         X, y = X.to(DEVICE), y.to(DEVICE)
         
-        if train:
-            optimizer.zero_grad()
-        
-        with torch.set_grad_enabled(train):
-            out = model(X)
-            loss = criterion(out, y)
-            
-            if train:
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                optimizer.step()
+        optimizer.zero_grad()
+        out = model(X)
+        loss = criterion(out, y)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
         
         total_loss += loss.item() * len(X)
-        
-        if not train:
-            preds.append(out.detach().cpu().numpy())
-            targets.append(y.cpu().numpy())
     
-    if train:
-        return total_loss / len(loader.dataset), None, None
-    else:
-        return total_loss / len(loader.dataset), np.concatenate(preds), np.concatenate(targets)
+    return total_loss / len(loader.dataset)
 
-# ================= DATA PREPARATION =================
-print("="*60)
-print("GRU MODEL TRAINING")
-print("="*60)
+def validate_epoch(loader, model, criterion):
+    """
+    Validate without target scaling since we predict actual temperatures
+    """
+    model.eval()
+    total_loss = 0
+    all_preds = []
+    all_targets = []
+    
+    with torch.no_grad():
+        for X, y in loader:
+            X, y = X.to(DEVICE), y.to(DEVICE)
+            out = model(X)
+            loss = criterion(out, y)
+            total_loss += loss.item() * len(X)
+            
+            all_preds.append(out.cpu().numpy())
+            all_targets.append(y.cpu().numpy())
+    
+    # Concatenate predictions and targets
+    preds = np.concatenate(all_preds).flatten()
+    targets = np.concatenate(all_targets).flatten()
+    
+    # Calculate metrics directly on actual temperatures
+    rmse = np.sqrt(mean_squared_error(targets, preds))
+    mae = mean_absolute_error(targets, preds)
+    
+    return total_loss / len(loader.dataset), preds, targets, rmse, mae
 
-print("\n1. Loading data...")
+# ================= MAIN =================
+print("\n" + "="*70)
+print("GRU MODEL - DIRECT TEMPERATURE PREDICTION")
+print("="*70)
+
+# Load data
+print("\n1. Loading and preparing data...")
 df = pd.read_csv(DATA_PATH)
 df["Date"] = pd.to_datetime(df["Date"])
 df = df.sort_values(["City", "Date"])
 
+# Show actual temperature ranges
+print(f"\n   ACTUAL TEMPERATURE RANGES:")
+print(f"   Full dataset T2M: [{df['T2M'].min():.2f}, {df['T2M'].max():.2f}]°C")
+print(f"   Full dataset T2M mean: {df['T2M'].mean():.2f}°C")
+
 # Add time features
 df = add_time_features(df)
 
-# Directly predict T2M
+# PREDICT T2M DIRECTLY
 features = get_features(df)
 target = "T2M"
 
@@ -158,164 +181,174 @@ train = df[df["Date"] <= "2020-12-31"].copy()
 val = df[(df["Date"] > "2020-12-31") & (df["Date"] <= "2022-12-31")].copy()
 test = df[df["Date"] > "2022-12-31"].copy()
 
-print(f"   Train: {len(train)} rows ({train['Date'].min()} to {train['Date'].max()})")
-print(f"   Val: {len(val)} rows ({val['Date'].min()} to {val['Date'].max()})")
-print(f"   Test: {len(test)} rows ({test['Date'].min()} to {test['Date'].max()})")
+print(f"\n2. Data Split Statistics:")
+print(f"   Train T2M: [{train['T2M'].min():.2f}, {train['T2M'].max():.2f}]°C, mean: {train['T2M'].mean():.2f}°C")
+print(f"   Val T2M: [{val['T2M'].min():.2f}, {val['T2M'].max():.2f}]°C, mean: {val['T2M'].mean():.2f}°C")
+print(f"   Test T2M: [{test['T2M'].min():.2f}, {test['T2M'].max():.2f}]°C, mean: {test['T2M'].mean():.2f}°C")
 
-# Scale features
+# Scale features only - target remains unscaled
+print(f"\n3. Scaling features only...")
 NUM_FEATURES = [f for f in features if f != "City_Code"]
-fs = StandardScaler()
-ts = StandardScaler()
+feature_scaler = StandardScaler()
 
-fs.fit(train[NUM_FEATURES])
-ts.fit(train[[target]])
+# Fit scaler on training data
+feature_scaler.fit(train[NUM_FEATURES])
 
+# Transform features for all datasets
 for d in [train, val, test]:
-    d.loc[:, NUM_FEATURES] = fs.transform(d[NUM_FEATURES])
-    d.loc[:, [target]] = ts.transform(d[[target]])
+    d.loc[:, NUM_FEATURES] = feature_scaler.transform(d[NUM_FEATURES])
+
+print(f"   ✓ Features scaled, target (T2M) remains unscaled")
 
 # Create sequences
-print("\n2. Creating sequences...")
-X_train, y_train, m_train = create_sequences(train, features, target, WINDOW)
-X_val, y_val, m_val = create_sequences(val, features, target, WINDOW)
-X_test, y_test, m_test = create_sequences(test, features, target, WINDOW)
+print(f"\n4. Creating sequences with window size {WINDOW}...")
+X_train, y_train, meta_train = create_sequences(train, features, target, WINDOW)
+X_val, y_val, meta_val = create_sequences(val, features, target, WINDOW)
+X_test, y_test, meta_test = create_sequences(test, features, target, WINDOW)
 
 print(f"   Train sequences: {len(X_train)}")
 print(f"   Val sequences: {len(X_val)}")
 print(f"   Test sequences: {len(X_test)}")
-print(f"   Features: {len(features)}")
-print(f"   Input shape: ({WINDOW}, {len(features)})")
+print(f"   Target range (actual temps): [{y_train.min():.2f}, {y_train.max():.2f}]°C")
 
 # Create data loaders
 train_dataset = TensorDataset(torch.tensor(X_train).float(), torch.tensor(y_train).float())
 val_dataset = TensorDataset(torch.tensor(X_val).float(), torch.tensor(y_val).float())
 test_dataset = TensorDataset(torch.tensor(X_test).float(), torch.tensor(y_test).float())
 
-train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
-val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, num_workers=0)
-test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, num_workers=0)
+train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE)
+test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE)
 
-# ================= TRAIN =================
-print("\n3. Training GRU model...")
-model = LightGRU(len(features)).to(DEVICE)
+# Train model
+print(f"\n5. Training GRU model...")
+model = DirectGRU(len(features)).to(DEVICE)
 criterion = nn.MSELoss()
 optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
 scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=5, factor=0.5)
 
-best_rmse = float("inf")
-patience = 0
-best_model_state = None
-
 print(f"   Model parameters: {sum(p.numel() for p in model.parameters()):,}")
-print(f"   Batch size: {BATCH_SIZE}")
-print(f"   Learning rate: {LR}")
-print("\nTraining progress:")
+print(f"   Input size: {len(features)}")
+print(f"   Hidden size: 128")
+print(f"   Num layers: 2")
 
+best_rmse = float('inf')
+best_model_state = None
+patience_counter = 0
+
+print("\n   Training progress:")
 for epoch in range(EPOCHS):
-    # Training
-    train_loss, _, _ = run_epoch(train_loader, model, optimizer, criterion, True)
+    # Train
+    train_loss = train_epoch(train_loader, model, optimizer, criterion)
     
-    # Validation
-    val_loss, vp, vt = run_epoch(val_loader, model, optimizer, criterion, False)
-    
-    # Inverse transform
-    vp = ts.inverse_transform(vp.reshape(-1, 1)).flatten()
-    vt = ts.inverse_transform(vt.reshape(-1, 1)).flatten()
-    
-    # Calculate metrics
-    rmse = np.sqrt(mean_squared_error(vt, vp))
-    mae = mean_absolute_error(vt, vp)
-    
-    print(f"   Epoch {epoch+1:2d}/{EPOCHS} | Loss: {train_loss:.4f} | Val RMSE: {rmse:.4f}°C | Val MAE: {mae:.4f}°C", end="")
+    # Validate
+    val_loss, val_preds, val_targets, val_rmse, val_mae = validate_epoch(
+        val_loader, model, criterion
+    )
     
     # Learning rate scheduling
-    scheduler.step(rmse)
+    scheduler.step(val_rmse)
+    
+    # Print progress every 10 epochs
+    if epoch % 10 == 0:
+        print(f"   Epoch {epoch:3d}/{EPOCHS} | Train Loss: {train_loss:.4f} | "
+              f"Val RMSE: {val_rmse:.4f}°C | Val MAE: {val_mae:.4f}°C")
     
     # Early stopping
-    if rmse < best_rmse:
-        best_rmse = rmse
-        patience = 0
+    if val_rmse < best_rmse:
+        best_rmse = val_rmse
         best_model_state = model.state_dict().copy()
-        torch.save(model.state_dict(), MODEL_FILE)
-        print(" ✓ (best)")
+        patience_counter = 0
+        if epoch % 5 == 0:
+            print(f"     ✓ New best model! RMSE: {val_rmse:.4f}°C")
     else:
-        patience += 1
-        print(f" | Patience: {patience}/{PATIENCE}")
-        
-        if patience >= PATIENCE:
-            print(f"\n   Early stopping triggered at epoch {epoch+1}")
+        patience_counter += 1
+        if patience_counter >= PATIENCE:
+            print(f"\n   Early stopping at epoch {epoch}")
             break
 
-# ================= EVALUATION =================
-print("\n4. Evaluating best model...")
+# Load best model
 model.load_state_dict(best_model_state)
-model.eval()
+
+# Final evaluation
+print(f"\n6. Final evaluation...")
 
 # Validation evaluation
-_, vp, vt = run_epoch(val_loader, model, optimizer, criterion, False)
-vp = ts.inverse_transform(vp.reshape(-1, 1)).flatten()
-vt = ts.inverse_transform(vt.reshape(-1, 1)).flatten()
+_, val_preds, val_targets, val_rmse, val_mae = validate_epoch(
+    val_loader, model, criterion
+)
 
 # Test evaluation
-_, tp, tt = run_epoch(test_loader, model, optimizer, criterion, False)
-tp = ts.inverse_transform(tp.reshape(-1, 1)).flatten()
-tt = ts.inverse_transform(tt.reshape(-1, 1)).flatten()
+_, test_preds, test_targets, test_rmse, test_mae = validate_epoch(
+    test_loader, model, criterion
+)
 
-# Calculate metrics
-val_rmse = np.sqrt(mean_squared_error(vt, vp))
-val_mae = mean_absolute_error(vt, vp)
-test_rmse = np.sqrt(mean_squared_error(tt, tp))
-test_mae = mean_absolute_error(tt, tp)
-
-print("\n" + "="*60)
+print("\n" + "="*70)
 print("FINAL RESULTS")
-print("="*60)
+print("="*70)
 print(f"Validation RMSE: {val_rmse:.4f}°C")
 print(f"Validation MAE: {val_mae:.4f}°C")
 print(f"Test RMSE: {test_rmse:.4f}°C")
 print(f"Test MAE: {test_mae:.4f}°C")
-print("="*60)
 
-# ================= SAVE PREDICTIONS =================
-print("\n5. Saving predictions...")
+print(f"\nPrediction Range Check:")
+print(f"  Actual test T2M range: [{test_targets.min():.2f}, {test_targets.max():.2f}]°C")
+print(f"  Predicted test range: [{test_preds.min():.2f}, {test_preds.max():.2f}]°C")
 
+# Check if predictions are reasonable
+if test_preds.min() > 0 and test_preds.max() < 50:
+    print("\n✅ SUCCESS! GRU predictions are in the correct temperature range!")
+else:
+    print(f"\n📊 GRU predictions: min={test_preds.min():.2f}°C, max={test_preds.max():.2f}°C")
+
+# Save predictions
+print(f"\n7. Saving predictions...")
+
+# Validation predictions
 val_df = pd.DataFrame({
-    "Date": m_val["Date"].dt.strftime("%Y-%m-%d"),
-    "City": m_val["City"],
-    "y_true": vt,
-    "gru_pred": vp,
+    "Date": meta_val["Date"].dt.strftime("%Y-%m-%d"),
+    "City": meta_val["City"],
+    "y_true": val_targets,
+    "gru_pred": val_preds
 })
+val_df.to_csv(f"{PREDICTIONS_PATH}/gru_val_preds_final.csv", index=False)
 
-test_df = pd.DataFrame({
-    "Date": m_test["Date"].dt.strftime("%Y-%m-%d"),
-    "City": m_test["City"],
-    "y_true": tt,
-    "gru_pred": tp,
+# Test predictions
+test_df_out = pd.DataFrame({
+    "Date": meta_test["Date"].dt.strftime("%Y-%m-%d"),
+    "City": meta_test["City"],
+    "y_true": test_targets,
+    "gru_pred": test_preds
 })
-
-val_df.to_csv(f"{PREDICTIONS_PATH}/gru_val_preds.csv", index=False)
-test_df.to_csv(f"{PREDICTIONS_PATH}/gru_test_preds.csv", index=False)
+test_df_out.to_csv(f"{PREDICTIONS_PATH}/gru_test_preds_final.csv", index=False)
 
 # Save metrics
 metrics_df = pd.DataFrame({
-    'model': ['GRU'],
+    'model': ['GRU_Final'],
     'val_rmse': [val_rmse],
     'val_mae': [val_mae],
     'test_rmse': [test_rmse],
-    'test_mae': [test_mae]
+    'test_mae': [test_mae],
+    'pred_min': [test_preds.min()],
+    'pred_max': [test_preds.max()],
+    'actual_min': [test_targets.min()],
+    'actual_max': [test_targets.max()]
 })
-metrics_df.to_csv(f"{PREDICTIONS_PATH}/gru_metrics.csv", index=False)
+metrics_df.to_csv(f"{PREDICTIONS_PATH}/gru_metrics_final.csv", index=False)
 
-print(f"   ✓ Validation predictions: {PREDICTIONS_PATH}/gru_val_preds.csv")
-print(f"   ✓ Test predictions: {PREDICTIONS_PATH}/gru_test_preds.csv")
-print(f"   ✓ Model saved: {MODEL_FILE}")
+# Save model
+torch.save(model.state_dict(), MODEL_FILE)
 
-# Print sample predictions
-print("\nSample predictions (first 10 test samples):")
-sample_df = test_df.head(10)[['Date', 'City', 'y_true', 'gru_pred']]
-sample_df['error'] = sample_df['y_true'] - sample_df['gru_pred']
-print(sample_df.to_string(index=False))
+print(f"   ✓ Model saved to {MODEL_FILE}")
+print(f"   ✓ Validation predictions saved to {PREDICTIONS_PATH}/gru_val_preds_final.csv")
+print(f"   ✓ Test predictions saved to {PREDICTIONS_PATH}/gru_test_preds_final.csv")
 
-print("\n" + "="*60)
-print("✅ GRU training completed successfully!")
-print("="*60)
+# Show sample predictions
+print("\n8. Sample predictions (first 10 test samples):")
+sample = test_df_out.head(10)[['Date', 'City', 'y_true', 'gru_pred']].copy()
+sample['error'] = sample['y_true'] - sample['gru_pred']
+print(sample.round(2).to_string(index=False))
+
+print("\n" + "="*70)
+print("✅ GRU TRAINING COMPLETE!")
+print("="*70)

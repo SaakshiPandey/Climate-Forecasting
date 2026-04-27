@@ -1,7 +1,3 @@
-"""
-COMPLETE FIXED GRU MODEL - Direct Temperature Prediction
-No target scaling - predicts actual temperatures directly
-"""
 
 import os
 import numpy as np
